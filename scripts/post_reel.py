@@ -126,11 +126,32 @@ def load_manifest() -> dict:
 def find_media_to_post() -> str | None:
     if not os.path.isdir(INCOMING_DIR):
         return None
-    candidates = sorted(
+    candidates = [
         f for f in os.listdir(INCOMING_DIR)
         if f.lower().endswith(IMAGE_EXTS + VIDEO_EXTS)
-    )
-    return candidates[0] if candidates else None
+    ]
+    if not candidates:
+        return None
+
+    # Files with a manifest entry carry a "post_date" that encodes the
+    # intended daily pillar rotation (Comeback & Resilience, Discipline &
+    # Habit Systems, Stoic Mindset, ...) -- sort those by that date first
+    # so posting actually rotates through pillars day to day instead of
+    # draining one pillar's ~167 images before moving to the next just
+    # because of filename order. Anything with no manifest entry (e.g. a
+    # video dropped in by hand) falls back to filename order, same as
+    # before, and sorts after every dated file.
+    manifest = load_manifest()
+
+    def sort_key(f: str):
+        entry = manifest.get(f)
+        post_date = entry.get("post_date") if entry else None
+        if post_date:
+            return (0, post_date, f)
+        return (1, f, f)
+
+    candidates.sort(key=sort_key)
+    return candidates[0]
 
 
 def caption_for(filename: str, state: dict, manifest: dict) -> str:
