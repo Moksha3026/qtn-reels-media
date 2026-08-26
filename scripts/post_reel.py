@@ -1,9 +1,16 @@
 """
-Runs inside GitHub Actions. Checks incoming/ for a video, posts the oldest one
-to Instagram with a rotating caption/hashtag/comment, then moves it to posted/.
+Runs inside GitHub Actions. Checks incoming/ for the oldest media file
+(image OR video), posts it to Instagram, then archives it to posted/.
 
-No Claude/Anthropic calls here on purpose -- captions come from CAPTION_BANK below
-so this script has zero dependency on anything but GitHub + Instagram's APIs.
+Caption + hashtags for each file are looked up by filename from
+scripts/manifest.json (built for the 1000-image quote-card batch). Any file
+with no manifest entry -- e.g. a video dropped in by hand -- falls back to
+the small built-in CAPTION_BANK, so the original hand-placed-video workflow
+still works exactly as before.
+
+No Claude/Anthropic calls here on purpose -- this script has zero runtime
+dependency on anything but GitHub + Instagram's APIs, so it keeps working
+on schedule with nobody watching.
 """
 
 import json
@@ -21,12 +28,18 @@ BRANCH = "main"
 INCOMING_DIR = "incoming"
 POSTED_DIR = "posted"
 STATE_FILE = "scripts/state.json"
+MANIFEST_FILE = "scripts/manifest.json"
 
 IG_USER_ID = os.environ["IG_USER_ID"]
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
 GRAPH_API = "https://graph.instagram.com/v21.0"
 
-CAPTION_BANK = [
+IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+VIDEO_EXTS = (".mp4", ".mov", ".m4v")
+
+# Fallback only -- used when a file in incoming/ has no matching entry in
+# manifest.json (keeps the original hand-placed-video flow working).
+FALLBACK_CAPTION_BANK = [
     {
         "caption": (
             "You don't need more motivation. You need fewer excuses. \U0001F525\n\n"
@@ -36,7 +49,6 @@ CAPTION_BANK = [
             "#dailymotivation #successmindset #motivationalquotes #selfgrowth "
             "#mentalstrength #stoicism #hustle #innerpeace #consistency #levelup"
         ),
-        "comment": "Which line hit you the hardest? \U0001F447 Tag someone who needs to see this.",
     },
     {
         "caption": (
@@ -48,7 +60,6 @@ CAPTION_BANK = [
             "#growthmindset #buildyourself #consistencyiskey #selfdiscipline "
             "#motivationdaily #hardwork #focusup #bebetter #keepgoing"
         ),
-        "comment": "What's one thing discipline has taught you? \U0001F447",
     },
     {
         "caption": (
@@ -59,7 +70,6 @@ CAPTION_BANK = [
             "#motivation #selfworth #ownyourlife #dailyreminder #resilience "
             "#stoicmindset #levelup #selfimprovement #keepgoing"
         ),
-        "comment": "Tag someone who needs to hear this today. \U0001F447",
     },
     {
         "caption": (
@@ -70,7 +80,6 @@ CAPTION_BANK = [
             "#dailymotivation #successhabits #mentalstrength #nopainnogain "
             "#levelup #dedication #focus #keepgoing"
         ),
-        "comment": "What's the last uncomfortable thing you did on purpose? \U0001F447",
     },
     {
         "caption": (
@@ -81,53 +90,75 @@ CAPTION_BANK = [
             "#growthmindset #successmindset #discipline #mentalhealth "
             "#keepgoing #hardwork #focus #stoicism #levelup"
         ),
-        "comment": "What would your future self thank you for doing today? \U0001F447",
     },
 ]
 
+COMMENT_BANK = [
+    "Which line hit you the hardest? \U0001F447",
+    "Tag someone who needs to see this today.",
+    "What's one thing you're taking from this? \U0001F447",
+    "Read that again if you needed it.",
+    "Save this for the day you want to quit.",
+]
+
+
+def load_json(path: str, default):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+
+def save_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
 
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"next_caption_index": 0}
+    return load_json(STATE_FILE, {"next_fallback_index": 0, "next_comment_index": 0, "posts_made": 0})
 
 
-def save_state(state: dict) -> None:
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+def load_manifest() -> dict:
+    return load_json(MANIFEST_FILE, {})
 
 
-def next_caption_and_comment() -> tuple[str, str]:
-    state = load_state()
-    idx = state.get("next_caption_index", 0) % len(CAPTION_BANK)
-    entry = CAPTION_BANK[idx]
-    state["next_caption_index"] = (idx + 1) % len(CAPTION_BANK)
-    save_state(state)
-    return entry["caption"], entry["comment"]
-
-
-def find_video_to_post() -> str | None:
+def find_media_to_post() -> str | None:
     if not os.path.isdir(INCOMING_DIR):
         return None
     candidates = sorted(
         f for f in os.listdir(INCOMING_DIR)
-        if f.lower().endswith((".mp4", ".mov", ".m4v"))
+        if f.lower().endswith(IMAGE_EXTS + VIDEO_EXTS)
     )
     return candidates[0] if candidates else None
 
 
-def create_media_container(video_url: str, caption: str) -> str:
-    resp = requests.post(
-        f"{GRAPH_API}/{IG_USER_ID}/media",
-        data={
-            "media_type": "REELS",
-            "video_url": video_url,
-            "caption": caption,
-            "access_token": IG_ACCESS_TOKEN,
-        },
-    )
+def caption_for(filename: str, state: dict, manifest: dict) -> str:
+    entry = manifest.get(filename)
+    if entry:
+        caption = entry["caption"]
+        if entry.get("hashtags"):
+            caption = f"{caption}\n\n{entry['hashtags']}"
+        return caption
+    idx = state.get("next_fallback_index", 0) % len(FALLBACK_CAPTION_BANK)
+    state["next_fallback_index"] = (idx + 1) % len(FALLBACK_CAPTION_BANK)
+    return FALLBACK_CAPTION_BANK[idx]["caption"]
+
+
+def comment_for(state: dict) -> str:
+    idx = state.get("next_comment_index", 0) % len(COMMENT_BANK)
+    state["next_comment_index"] = (idx + 1) % len(COMMENT_BANK)
+    return COMMENT_BANK[idx]
+
+
+def create_media_container(media_url: str, caption: str, is_video: bool) -> str:
+    data = {"caption": caption, "access_token": IG_ACCESS_TOKEN}
+    if is_video:
+        data["media_type"] = "REELS"
+        data["video_url"] = media_url
+    else:
+        data["image_url"] = media_url
+    resp = requests.post(f"{GRAPH_API}/{IG_USER_ID}/media", data=data)
     resp.raise_for_status()
     return resp.json()["id"]
 
@@ -145,9 +176,9 @@ def wait_until_ready(creation_id: str, timeout_seconds: int = 300) -> None:
         if status_code == "FINISHED":
             return
         if status_code == "ERROR":
-            raise RuntimeError(f"Instagram failed to process the video: {data}")
+            raise RuntimeError(f"Instagram failed to process the media: {data}")
         time.sleep(10)
-    raise TimeoutError("Timed out waiting for Instagram to finish processing the video")
+    raise TimeoutError("Timed out waiting for Instagram to finish processing the media")
 
 
 def publish_container(creation_id: str) -> str:
@@ -167,31 +198,41 @@ def post_comment(media_id: str, message: str) -> None:
 
 
 def main() -> None:
-    filename = find_video_to_post()
+    filename = find_media_to_post()
     if not filename:
-        print("No video waiting in incoming/. Nothing to do.")
+        print("No media waiting in incoming/. Nothing to do.")
         return
 
+    is_video = filename.lower().endswith(VIDEO_EXTS)
     raw_url = (
         f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{BRANCH}/"
         f"{INCOMING_DIR}/{urllib.parse.quote(filename)}"
     )
-    print(f"Found {filename} -> {raw_url}")
+    print(f"Found {filename} ({'video' if is_video else 'image'}) -> {raw_url}")
 
-    caption, comment = next_caption_and_comment()
+    state = load_state()
+    manifest = load_manifest()
+    caption = caption_for(filename, state, manifest)
+    comment = comment_for(state)
 
     print("Creating Instagram media container...")
-    creation_id = create_media_container(raw_url, caption)
+    creation_id = create_media_container(raw_url, caption, is_video)
 
-    print("Waiting for Instagram to process the video...")
-    wait_until_ready(creation_id)
+    print("Waiting for Instagram to process the media...")
+    wait_until_ready(creation_id, timeout_seconds=300 if is_video else 60)
 
     print("Publishing...")
     media_id = publish_container(creation_id)
     print(f"Published. Media ID: {media_id}")
 
     print("Posting comment...")
-    post_comment(media_id, comment)
+    try:
+        post_comment(media_id, comment)
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN: comment failed (non-fatal): {exc}")
+
+    state["posts_made"] = state.get("posts_made", 0) + 1
+    save_json(STATE_FILE, state)
 
     os.makedirs(POSTED_DIR, exist_ok=True)
     shutil.move(
