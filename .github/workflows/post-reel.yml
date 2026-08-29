@@ -2,10 +2,15 @@ name: Post Reel to Instagram
 
 on:
   schedule:
-    # Weekday evenings, IST (19:00 IST = 13:30 UTC)
-    - cron: "30 13 * * 1-5"
-    # Weekend late mornings, IST (11:00 IST = 05:30 UTC)
-    - cron: "30 5 * * 0,6"
+    # Runs every hour, every day. GitHub's `schedule` trigger is best-effort
+    # and can fire late or occasionally get skipped entirely under load --
+    # confirmed in practice (posts landing hours late, one day fully missed).
+    # Running hourly means post_reel.py itself decides whether "now" is a
+    # valid posting moment (see WEEKDAY/WEEKEND_TARGET_UTC and
+    # MIN_HOURS_BETWEEN_POSTS in that script) -- so even if a specific
+    # hour's trigger is late or skipped, the next one catches it within
+    # about an hour instead of many hours or a full missed day.
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 permissions:
