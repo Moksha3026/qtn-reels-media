@@ -19,6 +19,7 @@ import shutil
 import sys
 import time
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -33,6 +34,25 @@ MANIFEST_FILE = "scripts/manifest.json"
 IG_USER_ID = os.environ["IG_USER_ID"]
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
 GRAPH_API = "https://graph.instagram.com/v21.0"
+
+# --- Posting-window gate --------------------------------------------------
+# GitHub Actions `schedule` triggers are best-effort: under load they can
+# fire hours late, or occasionally not fire at all for a given slot. To stay
+# reliable despite that, the workflow now runs HOURLY (see post-reel.yml)
+# and this script decides for itself whether "now" is actually a valid
+# moment to post, using two checks:
+#   1. Have we reached today's target time yet? (weekday 13:30 UTC / 19:00
+#      IST, weekend 05:30 UTC / 11:00 IST) -- skip if we're still before it.
+#   2. Has enough time passed since the last successful post? -- skip if a
+#      post already went out recently, so a run that fires (or a delayed
+#      run that finally catches up) within the same day/window doesn't
+#      double-post.
+# If a specific hour's trigger is skipped or delayed by GitHub, the very
+# next hourly trigger will catch it -- worst case about an hour late,
+# instead of many hours late or missed entirely.
+WEEKDAY_TARGET_UTC = (13, 30)  # 19:00 IST, Mon-Fri (weekday() 0-4)
+WEEKEND_TARGET_UTC = (5, 30)   # 11:00 IST, Sat-Sun (weekday() 5-6)
+MIN_HOURS_BETWEEN_POSTS = 18   # guards against double-posting the same slot
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 VIDEO_EXTS = (".mp4", ".mov", ".m4v")
@@ -121,6 +141,38 @@ def load_state() -> dict:
 
 def load_manifest() -> dict:
     return load_json(MANIFEST_FILE, {})
+
+
+def should_post_now(state: dict) -> bool:
+    now = datetime.now(timezone.utc)
+    target_hour, target_minute = (
+        WEEKEND_TARGET_UTC if now.weekday() >= 5 else WEEKDAY_TARGET_UTC
+    )
+    target_today = now.replace(
+        hour=target_hour, minute=target_minute, second=0, microsecond=0
+    )
+    if now < target_today:
+        print(
+            f"Not yet at today's posting window ({target_today.isoformat()} "
+            f"UTC) -- current time {now.isoformat()}. Skipping."
+        )
+        return False
+
+    last_post_at = state.get("last_post_at")
+    if last_post_at:
+        try:
+            last_dt = datetime.fromisoformat(last_post_at)
+        except ValueError:
+            last_dt = None
+        if last_dt and (now - last_dt) < timedelta(hours=MIN_HOURS_BETWEEN_POSTS):
+            print(
+                f"Last post was at {last_post_at}, less than "
+                f"{MIN_HOURS_BETWEEN_POSTS}h ago. Skipping to avoid a "
+                f"duplicate post for today's slot."
+            )
+            return False
+
+    return True
 
 
 def find_media_to_post() -> str | None:
@@ -219,6 +271,10 @@ def post_comment(media_id: str, message: str) -> None:
 
 
 def main() -> None:
+    state = load_state()
+    if not should_post_now(state):
+        return
+
     filename = find_media_to_post()
     if not filename:
         print("No media waiting in incoming/. Nothing to do.")
@@ -231,7 +287,6 @@ def main() -> None:
     )
     print(f"Found {filename} ({'video' if is_video else 'image'}) -> {raw_url}")
 
-    state = load_state()
     manifest = load_manifest()
     caption = caption_for(filename, state, manifest)
     comment = comment_for(state)
@@ -253,6 +308,7 @@ def main() -> None:
         print(f"WARN: comment failed (non-fatal): {exc}")
 
     state["posts_made"] = state.get("posts_made", 0) + 1
+    state["last_post_at"] = datetime.now(timezone.utc).isoformat()
     save_json(STATE_FILE, state)
 
     os.makedirs(POSTED_DIR, exist_ok=True)
