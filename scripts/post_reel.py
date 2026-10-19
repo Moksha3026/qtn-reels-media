@@ -28,6 +28,10 @@ REPO_NAME = "qtn-reels-media"
 BRANCH = "main"
 INCOMING_DIR = "incoming"
 POSTED_DIR = "posted"
+# Files that Instagram rejects get moved here so they don't poison the
+# queue and block every future run on the same bad media. Kept for
+# inspection but no longer picked up by find_media_to_post().
+FAILED_DIR = "failed"
 STATE_FILE = "scripts/state.json"
 MANIFEST_FILE = "scripts/manifest.json"
 
@@ -270,6 +274,33 @@ def post_comment(media_id: str, message: str) -> None:
     ).raise_for_status()
 
 
+def quarantine_failed(filename: str, exc: requests.HTTPError) -> None:
+    """Log Instagram's actual error body and move the offending file out of
+    incoming/ so the next run isn't blocked retrying it. Files land in
+    failed/ for inspection and are no longer picked up by find_media_to_post."""
+    status = exc.response.status_code if exc.response is not None else "?"
+    body = exc.response.text if exc.response is not None else "<no response body>"
+    print(
+        f"Instagram rejected {filename}: HTTP {status}: {body}",
+        file=sys.stderr,
+    )
+    os.makedirs(FAILED_DIR, exist_ok=True)
+    try:
+        shutil.move(
+            os.path.join(INCOMING_DIR, filename),
+            os.path.join(FAILED_DIR, filename),
+        )
+        print(
+            f"Moved {filename} to {FAILED_DIR}/ (will skip on future runs)",
+            file=sys.stderr,
+        )
+    except Exception as move_exc:  # noqa: BLE001
+        print(
+            f"WARN: failed to move {filename} to {FAILED_DIR}/: {move_exc}",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     state = load_state()
     if not should_post_now(state):
@@ -281,18 +312,30 @@ def main() -> None:
         return
 
     is_video = filename.lower().endswith(VIDEO_EXTS)
-    raw_url = (
-        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{BRANCH}/"
+    # Serve the media through jsDelivr's CDN rather than
+    # raw.githubusercontent.com. Instagram's server-side fetcher reaches
+    # jsDelivr reliably across regions; raw.githubusercontent.com has
+    # periodically been blocked / unstable from Meta's CDN, which
+    # surfaces as a 400 Bad Request on the media-container endpoint
+    # even though the file is publicly reachable from other clients.
+    # jsDelivr also serves a global CDN with aggressive caching, which
+    # speeds up container processing.
+    media_url = (
+        f"https://cdn.jsdelivr.net/gh/{REPO_OWNER}/{REPO_NAME}@{BRANCH}/"
         f"{INCOMING_DIR}/{urllib.parse.quote(filename)}"
     )
-    print(f"Found {filename} ({'video' if is_video else 'image'}) -> {raw_url}")
+    print(f"Found {filename} ({'video' if is_video else 'image'}) -> {media_url}")
 
     manifest = load_manifest()
     caption = caption_for(filename, state, manifest)
     comment = comment_for(state)
 
     print("Creating Instagram media container...")
-    creation_id = create_media_container(raw_url, caption, is_video)
+    try:
+        creation_id = create_media_container(media_url, caption, is_video)
+    except requests.HTTPError as exc:
+        quarantine_failed(filename, exc)
+        raise
 
     print("Waiting for Instagram to process the media...")
     wait_until_ready(creation_id, timeout_seconds=300 if is_video else 60)
